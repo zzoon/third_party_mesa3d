@@ -27,6 +27,7 @@
 
 #include "float64_glsl.h"
 #include "float64q_glsl.h"
+#include "float64_tf96_glsl.h"
 #include "glsl_parser_extras.h"
 #include "glsl_to_nir.h"
 #include "ir_visitor.h"
@@ -2824,14 +2825,20 @@ glsl_float64_funcs_to_nir(struct gl_context *ctx,
    struct gl_shader *sh = _mesa_new_shader(-1, MESA_SHADER_VERTEX);
    const char* method = getenv("FP64_METHOD");
    char* label = "float64";
+
    if (method && !strcmp(method, "quick_soft")) {
       sh->Source = float64q_source;
       label = "float64q";
       mesa_logi("fp64 quick");
+   } else if (method && !strcmp(method, "tf96")) {
+      sh->Source = float64_tf96_source;
+      label = "float64 tf96";
+      mesa_logi("fp64 tf96");
    } else {
       sh->Source = float64_source;
       mesa_logi("fp64 origin");
    }
+
    sh->CompileStatus = COMPILE_FAILURE;
    _mesa_glsl_compile_shader(ctx, sh, NULL, false, false, true);
    nir_shader *nir = nir_shader_clone(NULL, sh->nir);
