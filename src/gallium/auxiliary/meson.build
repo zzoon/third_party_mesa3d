@@ -230,6 +230,8 @@ files_libgallium = files(
   'util/u_live_shader_cache.h',
   'util/u_log.c',
   'util/u_log.h',
+  'util/u_nir_opt_cache.c',
+  'util/u_nir_opt_cache.h',
   'util/u_prim.h',
   'util/u_prim.c',
   'util/u_prim_restart.c',

@@ -66,6 +66,7 @@ struct driOptionCache;
 struct u_transfer_helper;
 struct pipe_screen;
 struct util_queue_fence;
+struct util_nir_opt_cache;
 struct pipe_video_buffer;
 struct nir_shader;
 
@@ -90,6 +91,9 @@ typedef void (*pipe_driver_thread_func)(void *job, void *gdata, int thread_index
 struct pipe_screen {
    int refcnt;
    void *winsys_priv;
+
+   /** Optional screen-level NIR optimization result cache (NULL = disabled). */
+   struct util_nir_opt_cache *nir_opt_cache;
 
    const struct pipe_caps caps;
 

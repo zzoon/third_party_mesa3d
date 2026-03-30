@@ -39,6 +39,7 @@
 #include "nir_to_spirv/nir_to_spirv.h" // for SPIRV_VERSION
 
 #include "util/u_debug.h"
+#include "util/u_nir_opt_cache.h"
 #include "util/u_dl.h"
 #include "util/os_file.h"
 #include "util/u_memory.h"
@@ -1557,6 +1558,13 @@ zink_destroy_screen(struct pipe_screen *pscreen)
          _mesa_set_clear(&screen->pipeline_libs[i], NULL);
 
    zink_bo_deinit(screen);
+
+   if (screen->base.nir_opt_cache) {
+      util_nir_opt_cache_deinit(screen->base.nir_opt_cache);
+      free(screen->base.nir_opt_cache);
+      screen->base.nir_opt_cache = NULL;
+   }
+
    util_live_shader_cache_deinit(&screen->shaders);
 
    zink_descriptor_layouts_deinit(screen);
@@ -1777,7 +1785,7 @@ update_queue_props(struct zink_screen *screen)
       mesa_loge("ZINK: failed to allocate props!");
       return;
    }
-      
+
    VKSCR(GetPhysicalDeviceQueueFamilyProperties)(screen->pdev, &num_queues, props);
 
    bool found_gfx = false;
@@ -2926,9 +2934,9 @@ init_driver_workarounds(struct zink_screen *screen)
       break;
    }
 
-   if (zink_driverid(screen) == VK_DRIVER_ID_AMD_OPEN_SOURCE || 
-       zink_driverid(screen) == VK_DRIVER_ID_AMD_PROPRIETARY || 
-       zink_driverid(screen) == VK_DRIVER_ID_NVIDIA_PROPRIETARY || 
+   if (zink_driverid(screen) == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+       zink_driverid(screen) == VK_DRIVER_ID_AMD_PROPRIETARY ||
+       zink_driverid(screen) == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
        zink_driverid(screen) == VK_DRIVER_ID_MESA_RADV)
       screen->driver_workarounds.z24_unscaled_bias = 1<<23;
    else
@@ -3525,6 +3533,12 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    check_base_requirements(screen);
    util_live_shader_cache_init(&screen->shaders, zink_create_gfx_shader_state, zink_delete_shader_state);
+
+   if (getenv("ZINK_NIR_OPT_CACHE")) {
+      screen->base.nir_opt_cache = malloc(sizeof(struct util_nir_opt_cache));
+      if (screen->base.nir_opt_cache)
+         util_nir_opt_cache_init(screen->base.nir_opt_cache);
+   }
 
    screen->base.get_name = zink_get_name;
    if (screen->instance_info->have_KHR_external_memory_capabilities) {
