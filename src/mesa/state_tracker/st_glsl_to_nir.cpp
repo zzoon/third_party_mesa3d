@@ -43,6 +43,7 @@
 #include "st_shader_cache.h"
 
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_serialize.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/glsl_types.h"
 #include "compiler/glsl/glsl_to_nir.h"
@@ -55,6 +56,9 @@
 #include "compiler/glsl/string_to_uint_map.h"
 
 #include "util/log.h"
+#include "util/u_nir_opt_cache.h"
+#include "util/blob.h"
+#include "util/mesa-sha1.h"
 
 static int
 type_size(const struct glsl_type *type)
@@ -250,57 +254,95 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
     */
    _mesa_ensure_and_associate_uniform_storage(st->ctx, shader_program, prog, 28);
 
-   /* None of the builtins being lowered here can be produced by SPIR-V.  See
-    * _mesa_builtin_uniform_desc. Also drivers that support packed uniform
-    * storage don't need to lower builtins.
+   /* Use screen-level optimization shader cache to avoid
+    * repeating expensive passes (e.g. nir_lower_doubles / SoftFP64) for
+    * identical shaders compiled across multiple programs.
     */
-   if (!shader_program->data->spirv &&
-       !st->ctx->Const.PackedDriverUniformStorage)
-      NIR_PASS(_, nir, st_nir_lower_builtin);
+   struct util_nir_opt_cache *opt_cache = screen->nir_opt_cache;
+   unsigned char pre_sha1[SHA1_DIGEST_LENGTH] = {0};
+   bool cache_hit = false;
 
-   if (!screen->caps.nir_atomics_as_deref)
-      NIR_PASS(_, nir, gl_nir_lower_atomics, shader_program, true);
+   if (opt_cache) {
+      /* Compute SHA1 of the NIR just before the heavy lowering. */
+      struct blob pre_blob;
+      blob_init(&pre_blob);
+      nir_serialize(&pre_blob, nir, true);
 
-   NIR_PASS(_, nir, nir_opt_intrinsics);
+      struct mesa_sha1 sha1_ctx;
+      _mesa_sha1_init(&sha1_ctx);
+      _mesa_sha1_update(&sha1_ctx, pre_blob.data, pre_blob.size);
+      _mesa_sha1_final(&sha1_ctx, pre_sha1);
+      blob_finish(&pre_blob);
 
-   /* Lower 64-bit ops. */
-   if (nir->options->lower_int64_options ||
-       nir->options->lower_doubles_options) {
-      bool lowered_64bit_ops = false;
-      bool revectorize = false;
-
-      if (nir->options->lower_doubles_options) {
-         /* nir_lower_doubles is not prepared for vector ops, so if the backend doesn't
-          * request lower_alu_to_scalar until now, lower all 64 bit ops, and try to
-          * vectorize them afterwards again */
-         if (!nir->options->lower_to_scalar) {
-            NIR_PASS(revectorize, nir, nir_lower_alu_to_scalar, filter_64_bit_instr, nullptr);
-            NIR_PASS(revectorize, nir, nir_lower_phis_to_scalar, false);
-         }
-         /* doubles lowering requires frexp to be lowered first if it will be,
-          * since the pass generates other 64-bit ops.  Most backends lower
-          * frexp, and using doubles is rare, and using frexp is even more rare
-          * (no instances in shader-db), so we're not too worried about
-          * accidentally lowering a 32-bit frexp here.
-          */
-         NIR_PASS(lowered_64bit_ops, nir, nir_lower_frexp);
-
-         NIR_PASS(lowered_64bit_ops, nir, nir_lower_doubles,
-                  st->ctx->SoftFP64, nir->options->lower_doubles_options);
-      }
-      if (nir->options->lower_int64_options)
-         NIR_PASS(lowered_64bit_ops, nir, nir_lower_int64);
-
-      if (revectorize && !nir->options->vectorize_vec2_16bit)
-         NIR_PASS(_, nir, nir_opt_vectorize, nullptr, nullptr);
-
-      if (revectorize || lowered_64bit_ops)
-         gl_nir_opts(nir);
+      nir_shader *cached = util_nir_opt_cache_lookup(opt_cache, pre_sha1,
+                                                     nir->options);
+      if (cached) {
+         /* Cache hit: swap in the already-lowered NIR, skipping the passes. */
+         ralloc_free(prog->nir);
+         prog->nir = nir = cached;
+         cache_hit = true;
+         mesa_logi("[GL] opt cache HIT");
+      } else
+         mesa_logi("[GL] opt cache MISS");
    }
 
-   nir_variable_mode mask =
-      nir_var_shader_in | nir_var_shader_out | nir_var_function_temp;
-   nir_remove_dead_variables(nir, mask, NULL);
+   if (!cache_hit) {
+      /* None of the builtins being lowered here can be produced by SPIR-V.  See
+       * _mesa_builtin_uniform_desc. Also drivers that support packed uniform
+       * storage don't need to lower builtins.
+       */
+      if (!shader_program->data->spirv &&
+          !st->ctx->Const.PackedDriverUniformStorage)
+         NIR_PASS(_, nir, st_nir_lower_builtin);
+
+      if (!screen->caps.nir_atomics_as_deref)
+         NIR_PASS(_, nir, gl_nir_lower_atomics, shader_program, true);
+
+      NIR_PASS(_, nir, nir_opt_intrinsics);
+
+      /* Lower 64-bit ops. */
+      if (nir->options->lower_int64_options ||
+          nir->options->lower_doubles_options) {
+         bool lowered_64bit_ops = false;
+         bool revectorize = false;
+
+         if (nir->options->lower_doubles_options) {
+            /* nir_lower_doubles is not prepared for vector ops, so if the backend doesn't
+             * request lower_alu_to_scalar until now, lower all 64 bit ops, and try to
+             * vectorize them afterwards again */
+            if (!nir->options->lower_to_scalar) {
+               NIR_PASS(revectorize, nir, nir_lower_alu_to_scalar, filter_64_bit_instr, nullptr);
+               NIR_PASS(revectorize, nir, nir_lower_phis_to_scalar, false);
+            }
+            /* doubles lowering requires frexp to be lowered first if it will be,
+             * since the pass generates other 64-bit ops.  Most backends lower
+             * frexp, and using doubles is rare, and using frexp is even more rare
+             * (no instances in shader-db), so we're not too worried about
+             * accidentally lowering a 32-bit frexp here.
+             */
+            NIR_PASS(lowered_64bit_ops, nir, nir_lower_frexp);
+
+            NIR_PASS(lowered_64bit_ops, nir, nir_lower_doubles,
+                     st->ctx->SoftFP64, nir->options->lower_doubles_options);
+         }
+         if (nir->options->lower_int64_options)
+            NIR_PASS(lowered_64bit_ops, nir, nir_lower_int64);
+
+         if (revectorize && !nir->options->vectorize_vec2_16bit)
+            NIR_PASS(_, nir, nir_opt_vectorize, nullptr, nullptr);
+
+         if (revectorize || lowered_64bit_ops)
+            gl_nir_opts(nir);
+      }
+
+      nir_variable_mode mask =
+         nir_var_shader_in | nir_var_shader_out | nir_var_function_temp;
+      nir_remove_dead_variables(nir, mask, NULL);
+
+      /* Store the result so future identical shaders skip the passes. */
+      if (opt_cache)
+         util_nir_opt_cache_insert(opt_cache, pre_sha1, nir);
+   }
 
    if (!st->has_hw_atomics && !screen->caps.nir_atomics_as_deref) {
       unsigned align_offset_state = 0;
