@@ -258,11 +258,20 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
     * repeating expensive passes (e.g. nir_lower_doubles / SoftFP64) for
     * identical shaders compiled across multiple programs.
     */
-   struct util_nir_opt_cache *opt_cache = screen->nir_opt_cache;
    unsigned char pre_sha1[SHA1_DIGEST_LENGTH] = {0};
    bool cache_hit = false;
+   bool do_opt_cache = false;
 
-   if (opt_cache) {
+   if (screen->nir_opt_cache) {
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+      /* Only bother caching if the shader actually uses FP64 */
+      if (nir->info.bit_sizes_float & 64) {
+         do_opt_cache = true;  /* disable for this shader */
+      }
+   }
+
+   if (do_opt_cache) {
       /* Compute SHA1 of the NIR just before the heavy lowering. */
       struct blob pre_blob;
       blob_init(&pre_blob);
@@ -274,7 +283,7 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
       _mesa_sha1_final(&sha1_ctx, pre_sha1);
       blob_finish(&pre_blob);
 
-      nir_shader *cached = util_nir_opt_cache_lookup(opt_cache, pre_sha1,
+      nir_shader *cached = util_nir_opt_cache_lookup(screen->nir_opt_cache, pre_sha1,
                                                      nir->options);
       if (cached) {
          /* Cache hit: swap in the already-lowered NIR, skipping the passes. */
@@ -340,8 +349,8 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
       nir_remove_dead_variables(nir, mask, NULL);
 
       /* Store the result so future identical shaders skip the passes. */
-      if (opt_cache)
-         util_nir_opt_cache_insert(opt_cache, pre_sha1, nir);
+      if (do_opt_cache)
+         util_nir_opt_cache_insert(screen->nir_opt_cache, pre_sha1, nir);
    }
 
    if (!st->has_hw_atomics && !screen->caps.nir_atomics_as_deref) {
