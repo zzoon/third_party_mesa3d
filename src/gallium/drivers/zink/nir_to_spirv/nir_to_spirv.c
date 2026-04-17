@@ -2297,6 +2297,12 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
          result = emit_binop(ctx, SpvOpFOrdEqual, dest_type, src[0], src[1]);
       break;
 
+   case nir_op_ffma:
+      assert(nir_op_infos[alu->op].num_inputs == 3);
+      result = emit_builtin_triop(ctx, GLSLstd450Fma, dest_type,
+                                  src[0], src[1], src[2]);
+      break;
+
    case nir_op_flrp:
       assert(nir_op_infos[alu->op].num_inputs == 3);
       result = emit_builtin_triop(ctx, GLSLstd450FMix, dest_type,

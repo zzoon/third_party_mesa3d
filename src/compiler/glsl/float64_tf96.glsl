@@ -948,20 +948,10 @@ vec4 __splitComp(vec2 a)
    return vec4(a_hi.x, a_hi.y, a_lo.x, a_lo.y);
 }
 
-vec2 __split(float a)
-{
-   precise float t = a * 4097;
-   float a_hi = t - (t - a);
-   float a_lo = a - a_hi;
-   return vec2(a_hi, a_lo);
-}
-
 vec2 __twoProd(float a, float b)
 {
-   precise float p = a * b;
-   vec4 s = vec4(__split(a), __split(b));
-   float e = (s.x * s.z - p) + s.x * s.w + s.y * s.z + s.y * s.w;
-   return vec2(p, e);
+   float p = a * b;
+   return vec2(p, fma(a, b, -p));
 }
 
 uint64_t
