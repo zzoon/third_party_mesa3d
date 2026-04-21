@@ -954,22 +954,64 @@ vec2 __twoProd(float a, float b)
    return vec2(p, fma(a, b, -p));
 }
 
+/* Inner multiplication function on triple-float operands. No fold/unfold or
+ * pack/split: intended to be chained across consecutive fp64 multiplications
+ * without re-materializing a uint64_t each time.
+ */
+vec3
+__fmul64_core_unpacked(vec3 a, vec3 b)
+{
+   vec2 p0 = __twoProd(a.x, b.x);
+   vec2 p1 = __twoProd(a.x, b.y);
+   vec2 p2 = __twoProd(a.y, b.x);
+
+   vec2 st1 = __twoSum(p1.x, p2.x);
+   vec2 st2 = __twoSum(p0.y, st1.x);
+
+   float p_sum = fma(a.z, b.x, fma(a.x, b.z, a.y * b.y));
+   float low_sum = st1.y + st2.y + p1.y + p2.y + p_sum;
+
+   return __tf_renormalize(p0.x, st2.x, low_sum);
+}
+
 uint64_t
 __fmul64(uint64_t __a, uint64_t __b)
 {
-   // ==========================================
-   // 1. IEEE 754 Edge Case handling
-   // ==========================================
    uint signA = __extractFloat64Sign(__a);
    uint signB = __extractFloat64Sign(__b);
    uint signRes = signA ^ signB;
 
+   int expA = __extractFloat64Exp(__a);
+   int expB = __extractFloat64Exp(__b);
+
+   // ==========================================
+   // Exponent Folding
+   // ==========================================
+   int shift_exp = 0;
+   uint64_t a_fold = __a;
+   uint64_t b_fold = __b;
+   if (expA > 0) {
+       shift_exp += (expA - 0x3FF);
+       a_fold = (__a & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+   }
+   if (expB > 0) {
+       shift_exp += (expB - 0x3FF);
+       b_fold = (__b & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+   }
+
+   // ==========================================
+   // Split
+   // ==========================================
+   vec3 a = __splitFloat64ToFloats3(a_fold);
+   vec3 b = __splitFloat64ToFloats3(b_fold);
+
+   // ==========================================
+   // Edge Case handling
+   // ==========================================
    bool a_isnan = __is_nan(__a);
    bool b_isnan = __is_nan(__b);
    if (a_isnan || b_isnan) return __propagateFloat64NaN(__a, __b);
 
-   int expA = __extractFloat64Exp(__a);
-   int expB = __extractFloat64Exp(__b);
    bool a_isinf = (expA == 0x7FF);
    bool b_isinf = (expB == 0x7FF);
    bool a_iszero = ((__a & 0x7FFFFFFFFFFFFFFFul) == 0ul);
@@ -988,32 +1030,9 @@ __fmul64(uint64_t __a, uint64_t __b)
    }
 
    // ==========================================
-   // 2. Exponent Folding
+   // Math
    // ==========================================
-   int shift_exp = 0;
-   if (expA > 0) {
-       shift_exp += (expA - 0x3FF);
-       __a = (__a & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
-   }
-   if (expB > 0) {
-       shift_exp += (expB - 0x3FF);
-       __b = (__b & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
-   }
-
-   vec3 a = __splitFloat64ToFloats3(__a);
-   vec3 b = __splitFloat64ToFloats3(__b);
-
-   vec2 p0 = __twoProd(a.x, b.x);
-   vec2 p1 = __twoProd(a.x, b.y);
-   vec2 p2 = __twoProd(a.y, b.x);
-
-   vec2 st1 = __twoSum(p1.x, p2.x);
-   vec2 st2 = __twoSum(p0.y, st1.x);
-
-   float p_sum = fma(a.z, b.x, fma(a.x, b.z, a.y * b.y));
-   float low_sum = st1.y + st2.y + p1.y + p2.y + p_sum;
-
-   vec3 result_vec3 = __tf_renormalize(p0.x, st2.x, low_sum);
+   vec3 result_vec3 = __fmul64_core_unpacked(a, b);
    uint64_t result = __packFloat64FromFloats3(result_vec3);
 
    // ==========================================
