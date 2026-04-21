@@ -26,11 +26,14 @@ struct nir_lower_double_def {
    uint32_t index;
    bool packed;
 };
+
 struct lower_doubles_data {
    const nir_shader *softfp64;
    nir_lower_doubles_options options;
    struct set *defs;
+   struct hash_table *unpacked_of;
 };
+
 uint32_t hash_nir_lower_double_def(const void *p);
 bool nir_lower_double_def_equal(const void *void_a, const void *void_b);
 void destroy_lower_double_def(struct set_entry *entry);
