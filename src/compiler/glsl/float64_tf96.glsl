@@ -1081,9 +1081,120 @@ __normalizeFloat64Subnormal(uint aFrac0, uint aFrac1,
 }
 
 uint64_t
-__ffma64(uint64_t a, uint64_t b, uint64_t c)
+__ffma64(uint64_t __a, uint64_t __b, uint64_t __c)
 {
-   return __fadd64(__fmul64(a, b), c);
+   uint signA = __extractFloat64Sign(__a);
+   uint signB = __extractFloat64Sign(__b);
+   uint signC = __extractFloat64Sign(__c);
+   uint signMul = signA ^ signB;
+
+   int expA = __extractFloat64Exp(__a);
+   int expB = __extractFloat64Exp(__b);
+   int expC = __extractFloat64Exp(__c);
+
+   // ==========================================
+   // Exponent Folding
+   // ==========================================
+   int shift_mul = 0;
+   int shift_c = 0;
+   uint64_t a_fold = __a;
+   uint64_t b_fold = __b;
+   uint64_t c_fold = __c;
+   if (expA > 0) {
+      shift_mul += (expA - 0x3FF);
+      a_fold = (__a & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+   }
+   if (expB > 0) {
+      shift_mul += (expB - 0x3FF);
+      b_fold = (__b & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+   }
+   if (expC > 0) {
+      shift_c = expC - 0x3FF;
+      c_fold = (__c & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+   }
+
+   int max_shift = max(shift_mul, shift_c);
+   int delta_mul = shift_mul - max_shift;  // <= 0
+   int delta_c   = shift_c   - max_shift;  // <= 0
+
+   // ==========================================
+   // Split
+   // ==========================================
+   vec3 a_v3 = __splitFloat64ToFloats3(a_fold);
+   vec3 b_v3 = __splitFloat64ToFloats3(b_fold);
+   vec3 c_v3 = __splitFloat64ToFloats3(c_fold);
+
+   // ==========================================
+   // Edge Case handling
+   // ==========================================
+   bool a_isnan = __is_nan(__a);
+   bool b_isnan = __is_nan(__b);
+   bool c_isnan = __is_nan(__c);
+   if (a_isnan || b_isnan || c_isnan) {
+      uint64_t ab_nan = __propagateFloat64NaN(__a, __b);
+      return __propagateFloat64NaN(ab_nan, __c);
+   }
+
+   bool a_isinf = (expA == 0x7FF);
+   bool b_isinf = (expB == 0x7FF);
+   bool c_isinf = (expC == 0x7FF);
+   bool a_iszero = ((__a & 0x7FFFFFFFFFFFFFFFul) == 0ul);
+   bool b_iszero = ((__b & 0x7FFFFFFFFFFFFFFFul) == 0ul);
+
+   // inf * 0 = NaN
+   if ((a_isinf && b_iszero) || (b_isinf && a_iszero))
+      return 0xFFFFFFFFFFFFFFFFul;
+   // inf * finite + (-inf of same magnitude) = NaN
+   if ((a_isinf || b_isinf) && c_isinf && signMul != signC)
+      return 0xFFFFFFFFFFFFFFFFul;
+   // inf * finite + c = signed inf
+   if (a_isinf || b_isinf)
+      return __packFloat64(signMul, 0x7FF, 0u, 0u);
+   // finite*finite + inf = inf (c's sign)
+   if (c_isinf)
+      return __c;
+   // 0 * finite + c = c
+   if (a_iszero || b_iszero)
+      return __c;
+
+   // ==========================================
+   // Math
+   // ==========================================
+   vec3 ab_v3 = __fmul64_core_unpacked(a_v3, b_v3);
+
+   /* Scale factors: 2^delta, built by direct fp32 exponent construction.
+    * delta <= -127 flushes the term to zero (below fp32 normal range).
+    */
+   float scale_mul = (delta_mul > -127) ? uintBitsToFloat(uint(127 + delta_mul) << 23) : 0.0;
+   float scale_c   = (delta_c   > -127) ? uintBitsToFloat(uint(127 + delta_c)   << 23) : 0.0;
+   ab_v3 *= scale_mul;
+   c_v3  *= scale_c;
+
+   vec2 sum0 = __twoSum(ab_v3.x, c_v3.x);
+   vec2 sum1 = __twoSum(ab_v3.y, c_v3.y);
+   vec2 sum2 = __twoSum(ab_v3.z, c_v3.z);
+
+   vec2 mid_accum = __twoSum(sum0.y, sum1.x);
+   float low_accum = sum1.y + sum2.x + sum2.y;
+
+   vec3 result_v3 = __tf_renormalize(sum0.x, mid_accum.x, mid_accum.y + low_accum);
+   uint64_t result = __packFloat64FromFloats3(result_v3);
+
+   // ==========================================
+   // 4. Exponent Unfolding
+   // ==========================================
+   if (result != 0ul && max_shift != 0) {
+      int finalExp = __extractFloat64Exp(result) + max_shift;
+
+      if (finalExp >= 0x7FF)
+         return __packFloat64(__extractFloat64Sign(result), 0x7FF, 0u, 0u);
+      if (finalExp <= 0)
+         return __packFloat64(__extractFloat64Sign(result), 0, 0u, 0u);
+
+      result = (result & 0x800FFFFFFFFFFFFFul) | (uint64_t(finalExp) << 52);
+   }
+
+   return result;
 }
 
 /* Returns the result of converting the double-precision floating-point value
