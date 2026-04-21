@@ -857,6 +857,43 @@ uint64_t __packFloat64FromFloats3(vec3 v) {
     return __packFloat64(signX, finalExp, fracHi, fracLo);
 }
 
+/* Fold+split in one step: bring the fp64 exponent to 0x3FF, split the
+ * folded uint64 into a triple-float, and return the shift applied.
+ * Callers combine shift through chains at the NIR level and apply it
+ * back via __fp64_pack_vec3. Zero / subnormal inputs get shift = 0 so
+ * the pair can be round-tripped with no net effect.
+ */
+void __fp64_unpack_vec3(uint64_t __a, out vec3 v3, out int shift)
+{
+   int exp = __extractFloat64Exp(__a);
+   if (exp > 0) {
+      shift = exp - 0x3FF;
+      uint64_t folded = (__a & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+      v3 = __splitFloat64ToFloats3(folded);
+   } else {
+      shift = 0;
+      v3 = __splitFloat64ToFloats3(__a);
+   }
+}
+
+/* Pack triple-float back to uint64 and apply the saved shift to the
+ * resulting exponent. Handles overflow (to signed inf) and underflow
+ * (to signed zero) the same way the original __fmul64/__fadd64/__ffma64
+ * unfold tails did.
+ */
+uint64_t __fp64_pack_vec3(vec3 v3, int shift)
+{
+   uint64_t result = __packFloat64FromFloats3(v3);
+   if (result == 0ul || shift == 0)
+      return result;
+   int finalExp = __extractFloat64Exp(result) + shift;
+   uint sign = __extractFloat64Sign(result);
+   if (finalExp >= 0x7FF)
+      return __packFloat64(sign, 0x7FF, 0u, 0u);
+   if (finalExp <= 0)
+      return __packFloat64(sign, 0, 0u, 0u);
+   return (result & 0x800FFFFFFFFFFFFFul) | (uint64_t(finalExp) << 52);
+}
 
 /* Returns the result of adding the double-precision floating-point values
  * `a' and `b'.

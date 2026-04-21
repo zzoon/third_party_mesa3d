@@ -29,6 +29,233 @@
 #include <float.h>
 #include <math.h>
 
+/* tf96 softfp64 chain-optimization infrastructure.
+ *
+ * For fmul (and later fadd/ffma), we avoid re-doing the fold + split +
+ * pack + unfold work on every op by keeping each fp64 SSA def's
+ * "folded" form alive alongside a shift (int exponent offset from
+ * 0x3FF) through the NIR graph. The triple-float is in a safe fp32
+ * range; the shift tracks the fp64 exponent at the NIR int level and
+ * only gets baked back into bits at the final pack.
+ *
+ * Cache keys `(src_ssa, swizzle_index)` because at this point 64-bit
+ * ALU ops are scalars over possibly-vector SSA defs (e.g. a dvec4
+ * load), so each component is a distinct scalar cached independently.
+ */
+struct unpack_key {
+   nir_def *src;
+   unsigned swizzle;
+};
+
+struct unpacked_pair {
+   nir_def *v3;      /* vec3 folded to leading fp32 exp ~0 (value ~[1,2)). */
+   nir_def *shift;   /* int: fp64 biased exp - 0x3FF; 0 for zero/subnormal. */
+};
+
+static uint32_t
+unpack_key_hash(const void *key)
+{
+   const struct unpack_key *k = key;
+   uint32_t h = _mesa_hash_pointer(k->src);
+   return _mesa_hash_data_with_seed(&k->swizzle, sizeof(k->swizzle), h);
+}
+
+static bool
+unpack_key_equal(const void *a, const void *b)
+{
+   const struct unpack_key *ka = a;
+   const struct unpack_key *kb = b;
+   return ka->src == kb->src && ka->swizzle == kb->swizzle;
+}
+
+/* Identify the tf96 softfp64 library by the label stamped on its
+ * shader in glsl_float64_funcs_to_nir. Other variants (default fp64,
+ * float64q) don't provide the __fp64_unpack_vec3 / __fp64_pack_vec3
+ * helpers.
+ */
+static bool
+is_tf96_softfp64(const nir_shader *softfp64)
+{
+   return softfp64 && softfp64->info.label &&
+          strcmp(softfp64->info.label, "float64_tf96") == 0;
+}
+
+/* Inline __fp64_unpack_vec3(in uint64_t, out vec3, out int). Void-return
+ * GLSL function, so params are [a_in, v3_out, shift_out] in declaration
+ * order.
+ */
+static void
+inline_fp64_unpack_v3(nir_builder *b, const nir_shader *softfp64,
+                      nir_def *packed,
+                      nir_def **out_v3, nir_def **out_shift)
+{
+   *out_v3 = NULL;
+   *out_shift = NULL;
+   nir_function *func =
+      nir_shader_get_function_for_name(softfp64, "__fp64_unpack_vec3");
+   if (!func || !func->impl)
+      return;
+
+   nir_variable *a_var =
+      nir_local_variable_create(b->impl, glsl_uint64_t_type(), "unpack_in");
+   nir_deref_instr *a_deref = nir_build_deref_var(b, a_var);
+   nir_store_deref(b, a_deref, packed, ~0);
+
+   nir_variable *v3_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "unpack_v3");
+   nir_deref_instr *v3_deref = nir_build_deref_var(b, v3_var);
+
+   nir_variable *shift_var =
+      nir_local_variable_create(b->impl, glsl_int_type(), "unpack_shift");
+   nir_deref_instr *shift_deref = nir_build_deref_var(b, shift_var);
+
+   nir_def *params[3] = {
+      &a_deref->def, &v3_deref->def, &shift_deref->def
+   };
+   nir_inline_function_impl(b, func->impl, params, NULL);
+
+   *out_v3 = nir_load_deref(b, v3_deref);
+   *out_shift = nir_load_deref(b, shift_deref);
+}
+
+/* Inline __fp64_pack_vec3(in vec3, in int) -> uint64_t. Non-void return:
+ * params are [retval_out, v3_in, shift_in].
+ */
+static nir_def *
+inline_fp64_pack_v3(nir_builder *b, const nir_shader *softfp64,
+                    nir_def *v3, nir_def *shift)
+{
+   nir_function *func =
+      nir_shader_get_function_for_name(softfp64, "__fp64_pack_vec3");
+   if (!func || !func->impl)
+      return NULL;
+
+   nir_variable *ret_var =
+      nir_local_variable_create(b->impl, glsl_uint64_t_type(), "pack_ret");
+   nir_deref_instr *ret_deref = nir_build_deref_var(b, ret_var);
+
+   nir_variable *v3_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "pack_v3");
+   nir_deref_instr *v3_deref = nir_build_deref_var(b, v3_var);
+   nir_store_deref(b, v3_deref, v3, ~0);
+
+   nir_variable *shift_var =
+      nir_local_variable_create(b->impl, glsl_int_type(), "pack_shift");
+   nir_deref_instr *shift_deref = nir_build_deref_var(b, shift_var);
+   nir_store_deref(b, shift_deref, shift, ~0);
+
+   nir_def *params[3] = {
+      &ret_deref->def, &v3_deref->def, &shift_deref->def
+   };
+   nir_inline_function_impl(b, func->impl, params, NULL);
+   return nir_load_deref(b, ret_deref);
+}
+
+/* Inline __fmul64_core_unpacked(in vec3, in vec3) -> vec3. Returns the
+ * vec3 product (no fold/unfold -- caller tracks shift).
+ */
+static nir_def *
+inline_fmul_core_v3(nir_builder *b, const nir_shader *softfp64,
+                    nir_def *a_v3, nir_def *b_v3)
+{
+   nir_function *func =
+      nir_shader_get_function_for_name(softfp64, "__fmul64_core_unpacked");
+   if (!func || !func->impl)
+      return NULL;
+
+   nir_variable *ret_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "fmul_ret");
+   nir_deref_instr *ret_deref = nir_build_deref_var(b, ret_var);
+
+   nir_variable *a_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "fmul_a");
+   nir_deref_instr *a_deref = nir_build_deref_var(b, a_var);
+   nir_store_deref(b, a_deref, a_v3, ~0);
+
+   nir_variable *bv_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "fmul_b");
+   nir_deref_instr *bv_deref = nir_build_deref_var(b, bv_var);
+   nir_store_deref(b, bv_deref, b_v3, ~0);
+
+   nir_def *params[3] = {
+      &ret_deref->def, &a_deref->def, &bv_deref->def
+   };
+   nir_inline_function_impl(b, func->impl, params, NULL);
+   return nir_load_deref(b, ret_deref);
+}
+
+/* Get-or-emit the (v3, shift) pair for an fp64 SSA operand. Shared
+ * operands across fp64 ops hit the cache and reuse both defs. */
+static struct unpacked_pair
+get_unpacked_v3(nir_builder *b, struct lower_doubles_data *data,
+                nir_alu_src alu_src)
+{
+   struct unpack_key key = {
+      .src = alu_src.src.ssa,
+      .swizzle = alu_src.swizzle[0],
+   };
+   struct hash_entry *e = _mesa_hash_table_search(data->unpacked_of, &key);
+   if (e) {
+      //fprintf(stderr, "[fp64 cache] UNPACK HIT  src=%p sw=%u\n",
+      //        (void *)key.src, key.swizzle);
+      return *(struct unpacked_pair *)e->data;
+   }
+   //fprintf(stderr, "[fp64 cache] UNPACK MISS src=%p sw=%u\n",
+   //        (void *)key.src, key.swizzle);
+
+   /* Materialize a scalar uint64 from the (possibly vector + swizzle) src. */
+   nir_def *src_scalar = nir_mov_alu(b, alu_src, 1);
+
+   struct unpacked_pair pair;
+   inline_fp64_unpack_v3(b, data->softfp64, src_scalar, &pair.v3, &pair.shift);
+
+   if (pair.v3 && pair.shift) {
+      struct unpack_key *entry_key =
+         ralloc(data->unpacked_of, struct unpack_key);
+      *entry_key = key;
+      struct unpacked_pair *entry =
+         ralloc(data->unpacked_of, struct unpacked_pair);
+      *entry = pair;
+      _mesa_hash_table_insert(data->unpacked_of, entry_key, entry);
+   }
+   return pair;
+}
+
+/* Lower a 64-bit fmul: unpack both operands, multiply the vec3s, add
+ * shifts, pack. Cache the output's (v3, shift) so the next op consuming
+ * the packed result skips the unpack.
+ */
+static nir_def *
+lower_fmul_chained(nir_builder *b, struct lower_doubles_data *data,
+                   nir_alu_instr *instr)
+{
+   struct unpacked_pair a = get_unpacked_v3(b, data, instr->src[0]);
+   struct unpacked_pair bp = get_unpacked_v3(b, data, instr->src[1]);
+   if (!a.v3 || !bp.v3)
+      return NULL;
+
+   nir_def *rv3 = inline_fmul_core_v3(b, data->softfp64, a.v3, bp.v3);
+   if (!rv3)
+      return NULL;
+
+   nir_def *rshift = nir_iadd(b, a.shift, bp.shift);
+   nir_def *packed = inline_fp64_pack_v3(b, data->softfp64, rv3, rshift);
+   if (!packed)
+      return NULL;
+
+   struct unpack_key *entry_key =
+      ralloc(data->unpacked_of, struct unpack_key);
+   entry_key->src = packed;
+   entry_key->swizzle = 0;
+   struct unpacked_pair *entry =
+      ralloc(data->unpacked_of, struct unpacked_pair);
+   entry->v3 = rv3;
+   entry->shift = rshift;
+   _mesa_hash_table_insert(data->unpacked_of, entry_key, entry);
+
+   return packed;
+}
+
 /*
  * Lowers some unsupported double operations, using only:
  *
@@ -536,8 +763,20 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
                             const struct lower_doubles_data *data)
 {
    nir_lower_doubles_options options = data->options;
+
    if (!(options & nir_lower_fp64_full_software))
       return NULL;
+
+   /* 64-bit fmul uses the chain-optimized path: operands are unpacked
+    * once into (vec3, shift) pairs, cached, and combined at NIR level.
+    * The final pack writes the shift back. See struct unpacked_pair.
+    */
+   if (instr->op == nir_op_fmul && data->unpacked_of) {
+      nir_def *r = lower_fmul_chained(b, (struct lower_doubles_data *)data, instr);
+      if (r)
+         return r;
+      /* Fall through to the generic packed path if setup failed. */
+   }
 
    const char *name;
    const char *mangled_name;
@@ -829,7 +1068,7 @@ nir_lower_doubles_op_to_options_mask(nir_op opcode)
 static bool
 should_lower_double_instr(const nir_instr *instr, const void *_data)
 {
-   const struct lower_doubles_data *data = _data;
+   struct lower_doubles_data *data = (struct lower_doubles_data *)_data;
    const nir_lower_doubles_options options = data->options;
 
    if (instr->type != nir_instr_type_alu) {
@@ -930,6 +1169,22 @@ lower_doubles_instr(nir_builder *b, nir_instr *instr, void *_data)
    }
 }
 
+/* Chain cache gate: full-software fp64, tf96 library selected, and
+ * TF96_CACHE=1 in the environment. Default is off so we don't
+ * perturb other softfp64 methods or correctness testing implicitly.
+ */
+static bool
+chain_cache_enabled(const nir_shader *softfp64,
+                    nir_lower_doubles_options options)
+{
+   if (!(options & nir_lower_fp64_full_software))
+      return false;
+   if (!is_tf96_softfp64(softfp64))
+      return false;
+   const char *env = getenv("TF96_CACHE");
+   return env && strcmp(env, "1") == 0;
+}
+
 static bool
 nir_lower_doubles_impl(nir_function_impl *impl,
                        const nir_shader *softfp64,
@@ -939,6 +1194,10 @@ nir_lower_doubles_impl(nir_function_impl *impl,
       .softfp64 = softfp64,
       .options = options,
       .defs = _mesa_set_create(NULL, hash_nir_lower_double_def, nir_lower_double_def_equal),
+      .unpacked_of = chain_cache_enabled(softfp64, options)
+                     ? _mesa_hash_table_create(NULL, unpack_key_hash,
+                                               unpack_key_equal)
+                     : NULL,
    };
 
    bool progress =
@@ -946,6 +1205,9 @@ nir_lower_doubles_impl(nir_function_impl *impl,
                                            should_lower_double_instr,
                                            lower_doubles_instr,
                                            &data);
+
+   if (data.unpacked_of)
+      _mesa_hash_table_destroy(data.unpacked_of, NULL);
 
    if (progress && (options & nir_lower_fp64_full_software)) {
       /* Indices are completely messed up now */
