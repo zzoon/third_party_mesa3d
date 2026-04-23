@@ -1308,7 +1308,7 @@ zink_screen_init_compiler(struct zink_screen *screen)
    default_options = {
       .io_options = nir_io_has_intrinsics | nir_io_separate_clip_cull_distance_arrays,
       .lower_ffma16 = true,
-      //.lower_ffma32 = true,
+      .lower_ffma32 = true,
       .lower_ffma64 = true,
       .lower_scmp = true,
       .lower_fdph = true,
