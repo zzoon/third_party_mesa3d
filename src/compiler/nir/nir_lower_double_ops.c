@@ -48,8 +48,10 @@ struct unpack_key {
 };
 
 struct unpacked_pair {
-   nir_def *v3;      /* vec3 folded to leading fp32 exp ~0 (value ~[1,2)). */
-   nir_def *shift;   /* int: fp64 biased exp - 0x3FF; 0 for zero/subnormal. */
+   nir_def *v3;        /* vec3 folded to leading fp32 exp ~0 (value ~[1,2)). */
+   nir_def *shift;     /* int: fp64 biased exp - 0x3FF; 0 for zero/subnormal. */
+   nir_def *is_inf;    /* bool: true if any upstream operand had exp=0x7FF.   */
+   nir_def *inf_sign;  /* i32: sign bit for inf-construction (bit 31 set).    */
 };
 
 static uint32_t
@@ -209,6 +211,13 @@ get_unpacked_v3(nir_builder *b, struct lower_doubles_data *data,
    struct unpacked_pair pair;
    inline_fp64_unpack_v3(b, data->softfp64, src_scalar, &pair.v3, &pair.shift);
 
+   /* Derive inf taint from the original packed bits so chain ops can
+    * propagate inf correctness through the cache. */
+   nir_def *hi = nir_unpack_64_2x32_split_y(b, src_scalar);
+   nir_def *biased_exp = nir_iand_imm(b, nir_ushr_imm(b, hi, 20), 0x7FF);
+   pair.is_inf = nir_ieq_imm(b, biased_exp, 0x7FF);
+   pair.inf_sign = nir_iand_imm(b, hi, 0x80000000);
+
    if (pair.v3 && pair.shift) {
       struct unpack_key *entry_key =
          ralloc(data->unpacked_of, struct unpack_key);
@@ -222,8 +231,8 @@ get_unpacked_v3(nir_builder *b, struct lower_doubles_data *data,
 }
 
 /* Lower a 64-bit fmul: unpack both operands, multiply the vec3s, add
- * shifts, pack. Cache the output's (v3, shift) so the next op consuming
- * the packed result skips the unpack.
+ * shifts, pack. Cache the output's (v3, shift, is_inf, inf_sign) so the
+ * next op consuming the packed result skips the unpack.
  */
 static nir_def *
 lower_fmul_chained(nir_builder *b, struct lower_doubles_data *data,
@@ -239,9 +248,19 @@ lower_fmul_chained(nir_builder *b, struct lower_doubles_data *data,
       return NULL;
 
    nir_def *rshift = nir_iadd(b, a.shift, bp.shift);
-   nir_def *packed = inline_fp64_pack_v3(b, data->softfp64, rv3, rshift);
-   if (!packed)
+
+   /* Propagate inf taint through the chain. */
+   nir_def *r_is_inf = nir_ior(b, a.is_inf, bp.is_inf);
+   nir_def *r_inf_sign = nir_ixor(b, a.inf_sign, bp.inf_sign);
+
+   nir_def *chain_packed =
+      inline_fp64_pack_v3(b, data->softfp64, rv3, rshift);
+   if (!chain_packed)
       return NULL;
+   nir_def *inf_hi = nir_ior_imm(b, r_inf_sign, 0x7FF00000);
+   nir_def *inf_result =
+      nir_pack_64_2x32_split(b, nir_imm_int(b, 0), inf_hi);
+   nir_def *packed = nir_bcsel(b, r_is_inf, inf_result, chain_packed);
 
    struct unpack_key *entry_key =
       ralloc(data->unpacked_of, struct unpack_key);
@@ -251,6 +270,8 @@ lower_fmul_chained(nir_builder *b, struct lower_doubles_data *data,
       ralloc(data->unpacked_of, struct unpacked_pair);
    entry->v3 = rv3;
    entry->shift = rshift;
+   entry->is_inf = r_is_inf;
+   entry->inf_sign = r_inf_sign;
    _mesa_hash_table_insert(data->unpacked_of, entry_key, entry);
 
    return packed;
