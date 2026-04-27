@@ -32,6 +32,8 @@ struct lower_doubles_data {
    nir_lower_doubles_options options;
    struct set *defs;
    struct hash_table *unpacked_of;
+   /* Read by lower_*_chained to decide whether to skip the final pack. */
+   bool current_lazy_pack;
 };
 
 uint32_t hash_nir_lower_double_def(const void *p);

@@ -294,6 +294,76 @@ cache_pack_output(struct lower_doubles_data *data, nir_def *packed,
    _mesa_hash_table_insert(data->unpacked_of, entry_key, entry);
 }
 
+/* Whether this use route through a chain lowerer that reads the unpacked
+ * tuple from the cache rather than the packed bits. Anything else
+ * (if-condition, comparisons, intrinsics, pack_64_2x32_split, phis,
+ * non-fp64 ALU) forces us to do the pack.
+ */
+static bool
+chain_lowerable_use(nir_src *use)
+{
+   if (nir_src_is_if(use))
+      return false;
+
+   nir_instr *parent = nir_src_parent_instr(use);
+   if (parent->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(parent);
+   if (alu->def.bit_size != 64)
+      return false;
+
+   switch (alu->op) {
+   case nir_op_fmul:
+   case nir_op_fadd:
+      break;
+   default:
+      return false;
+   }
+
+   return true;
+}
+
+static bool
+def_only_chain_used(const nir_def *def)
+{
+   bool any = false;
+   nir_foreach_use_including_if(use, def) {
+      if (!chain_lowerable_use(use))
+         return false;
+      any = true;
+   }
+   return any;
+}
+
+/* Common tail for every chain lowerer: either skip the pack and return
+ * an undef (lazy path -- consumers route through the cache via
+ * get_unpacked_v3 on the rewritten src), or emit the pack with the inf
+ * bcsel fallback. Either way the (def -> tuple) entry is registered.
+ */
+static nir_def *
+finalize_chain_output(nir_builder *b, struct lower_doubles_data *data,
+                      struct unpacked_pair out)
+{
+   if (data->current_lazy_pack) {
+      nir_def *u = nir_undef(b, 1, 64);
+      cache_pack_output(data, u, out);
+      return u;
+   }
+
+   nir_def *chain_packed =
+      inline_fp64_pack_v3(b, data->softfp64, out.v3, out.shift);
+   if (!chain_packed)
+      return NULL;
+   nir_def *inf_hi = nir_ior_imm(b, out.inf_sign, 0x7FF00000);
+   nir_def *inf_result =
+      nir_pack_64_2x32_split(b, nir_imm_int(b, 0), inf_hi);
+   nir_def *packed = nir_bcsel(b, out.is_inf, inf_result, chain_packed);
+
+   cache_pack_output(data, packed, out);
+   return packed;
+}
+
 /* Lower a 64-bit fmul: unpack both operands, multiply the vec3s, add
  * shifts, pack. Cache the output's (v3, shift, is_inf, inf_sign) so the
  * next op consuming the packed result skips the unpack.
@@ -311,27 +381,14 @@ lower_fmul_chained(nir_builder *b, struct lower_doubles_data *data,
    if (!rv3)
       return NULL;
 
-   nir_def *rshift = nir_iadd(b, a.shift, bp.shift);
+   struct unpacked_pair out = {
+      .v3       = rv3,
+      .shift    = nir_iadd(b, a.shift, bp.shift),
+      .is_inf   = nir_ior(b, a.is_inf, bp.is_inf),
+      .inf_sign = nir_ixor(b, a.inf_sign, bp.inf_sign),
+   };
 
-   /* Propagate inf taint through the chain. */
-   nir_def *r_is_inf = nir_ior(b, a.is_inf, bp.is_inf);
-   nir_def *r_inf_sign = nir_ixor(b, a.inf_sign, bp.inf_sign);
-
-   nir_def *chain_packed =
-      inline_fp64_pack_v3(b, data->softfp64, rv3, rshift);
-   if (!chain_packed)
-      return NULL;
-   nir_def *inf_hi = nir_ior_imm(b, r_inf_sign, 0x7FF00000);
-   nir_def *inf_result =
-      nir_pack_64_2x32_split(b, nir_imm_int(b, 0), inf_hi);
-   nir_def *packed = nir_bcsel(b, r_is_inf, inf_result, chain_packed);
-
-   cache_pack_output(data, packed, (struct unpacked_pair) {
-      .v3 = rv3, .shift = rshift,
-      .is_inf = r_is_inf, .inf_sign = r_inf_sign,
-   });
-
-   return packed;
+   return finalize_chain_output(b, data, out);
 }
 
 /* Lower a 64-bit fadd: unpack both operands, align them to a common
@@ -368,23 +425,14 @@ lower_fadd_chained(nir_builder *b, struct lower_doubles_data *data,
     * -opposite-sign (should be NaN) falls through as a signed inf -- same
     * approximation as the existing fmul chain for inf*0.
     */
-   nir_def *r_is_inf = nir_ior(b, a.is_inf, bp.is_inf);
-   nir_def *r_inf_sign = nir_bcsel(b, a.is_inf, a.inf_sign, bp.inf_sign);
-   nir_def *chain_packed = inline_fp64_pack_v3(b, data->softfp64, rv3, rshift);
+   struct unpacked_pair out = {
+      .v3       = rv3,
+      .shift    = rshift,
+      .is_inf   = nir_ior(b, a.is_inf, bp.is_inf),
+      .inf_sign = nir_bcsel(b, a.is_inf, a.inf_sign, bp.inf_sign),
+   };
 
-   if (!chain_packed)
-      return NULL;
-
-   nir_def *inf_hi = nir_ior_imm(b, r_inf_sign, 0x7FF00000);
-   nir_def *inf_result = nir_pack_64_2x32_split(b, nir_imm_int(b, 0), inf_hi);
-   nir_def *packed = nir_bcsel(b, r_is_inf, inf_result, chain_packed);
-
-   cache_pack_output(data, packed, (struct unpacked_pair) {
-      .v3 = rv3, .shift = rshift,
-      .is_inf = r_is_inf, .inf_sign = r_inf_sign,
-   });
-
-   return packed;
+   return finalize_chain_output(b, data, out);
 }
 
 
@@ -1229,6 +1277,12 @@ should_lower_double_instr(const nir_instr *instr, const void *_data)
 
    if (!is_64)
       return false;
+
+   data->current_lazy_pack = false;
+   if (data->unpacked_of && alu->def.bit_size == 64 &&
+       (alu->op == nir_op_fmul || alu->op == nir_op_fadd)) {
+      data->current_lazy_pack = def_only_chain_used(&alu->def);
+   }
 
    if (options & nir_lower_fp64_full_software)
       return true;
