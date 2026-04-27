@@ -1021,6 +1021,25 @@ __fmul64_core_unpacked(vec3 a, vec3 b)
    return __tf_renormalize(p0.x, st2.x, low_sum);
 }
 
+/* Inner add function on triple-float operands pre-aligned to a common
+ * scale by the caller. No fold/unfold: intended to be chained across
+ * consecutive fp64 fadds without re-materializing a uint64_t. The two
+ * operands must share a shift; the caller scales the lower-shift
+ * operand's vec3 down to the higher-shift scale before calling.
+ */
+vec3
+__fadd64_core_unpacked(vec3 a, vec3 b)
+{
+   vec2 st0 = __twoSum(a.x, b.x);
+   vec2 st1 = __twoSum(a.y, b.y);
+   vec2 st2 = __twoSum(a.z, b.z);
+
+   vec2 mid_accum = __twoSum(st0.y, st1.x);
+   float low_accum = st1.y + st2.x + st2.y;
+
+   return __tf_renormalize(st0.x, mid_accum.x, mid_accum.y + low_accum);
+}
+
 uint64_t
 __fmul64(uint64_t __a, uint64_t __b)
 {

@@ -79,7 +79,7 @@ static bool
 is_tf96_softfp64(const nir_shader *softfp64)
 {
    return softfp64 && softfp64->info.label &&
-          strcmp(softfp64->info.label, "float64_tf96") == 0;
+          strcmp(softfp64->info.label, "float64 tf96") == 0;
 }
 
 /* Inline __fp64_unpack_vec3(in uint64_t, out vec3, out int). Void-return
@@ -186,6 +186,53 @@ inline_fmul_core_v3(nir_builder *b, const nir_shader *softfp64,
    return nir_load_deref(b, ret_deref);
 }
 
+/* Inline __fadd64_core_unpacked(in vec3, in vec3) -> vec3. Caller pre-aligns
+ * both operands to a common shift via build_scale_from_delta.
+ */
+static nir_def *
+inline_fadd_core_v3(nir_builder *b, const nir_shader *softfp64,
+                    nir_def *a_v3, nir_def *b_v3)
+{
+   nir_function *func =
+      nir_shader_get_function_for_name(softfp64, "__fadd64_core_unpacked");
+   if (!func || !func->impl)
+      return NULL;
+
+   nir_variable *ret_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "fadd_ret");
+   nir_deref_instr *ret_deref = nir_build_deref_var(b, ret_var);
+
+   nir_variable *a_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "fadd_a");
+   nir_deref_instr *a_deref = nir_build_deref_var(b, a_var);
+   nir_store_deref(b, a_deref, a_v3, ~0);
+
+   nir_variable *bv_var =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "fadd_b");
+   nir_deref_instr *bv_deref = nir_build_deref_var(b, bv_var);
+   nir_store_deref(b, bv_deref, b_v3, ~0);
+
+   nir_def *params[3] = {
+      &ret_deref->def, &a_deref->def, &bv_deref->def
+   };
+   nir_inline_function_impl(b, func->impl, params, NULL);
+   return nir_load_deref(b, ret_deref);
+}
+
+/* Build the fp32 scale factor 2^delta from a signed int delta. Used by
+ * the fadd chain to align two (vec3, shift) operands to a common shift:
+ * the operand with the smaller shift is scaled down by 2^(shift - smax).
+ * For delta below fp32's smallest normal exponent we flush to zero --
+ * semantically the same as __fadd64's nExp <= 0 early-out.
+ */
+static nir_def *
+build_scale_from_delta(nir_builder *b, nir_def *delta)
+{
+   nir_def *bits = nir_ishl_imm(b, nir_iadd_imm(b, delta, 127), 23);
+   return nir_bcsel(b, nir_ige_imm(b, delta, -126),
+                    bits, nir_imm_float(b, 0.0));
+}
+
 /* Get-or-emit the (v3, shift) pair for an fp64 SSA operand. Shared
  * operands across fp64 ops hit the cache and reuse both defs. */
 static struct unpacked_pair
@@ -230,6 +277,23 @@ get_unpacked_v3(nir_builder *b, struct lower_doubles_data *data,
    return pair;
 }
 
+/* Insert (packed -> unpacked_pair) into the cache so downstream ops
+ * consuming `packed` hit the cache and skip the unpack.
+ */
+static void
+cache_pack_output(struct lower_doubles_data *data, nir_def *packed,
+                  struct unpacked_pair pair)
+{
+   struct unpack_key *entry_key =
+      ralloc(data->unpacked_of, struct unpack_key);
+   entry_key->src = packed;
+   entry_key->swizzle = 0;
+   struct unpacked_pair *entry =
+      ralloc(data->unpacked_of, struct unpacked_pair);
+   *entry = pair;
+   _mesa_hash_table_insert(data->unpacked_of, entry_key, entry);
+}
+
 /* Lower a 64-bit fmul: unpack both operands, multiply the vec3s, add
  * shifts, pack. Cache the output's (v3, shift, is_inf, inf_sign) so the
  * next op consuming the packed result skips the unpack.
@@ -262,20 +326,67 @@ lower_fmul_chained(nir_builder *b, struct lower_doubles_data *data,
       nir_pack_64_2x32_split(b, nir_imm_int(b, 0), inf_hi);
    nir_def *packed = nir_bcsel(b, r_is_inf, inf_result, chain_packed);
 
-   struct unpack_key *entry_key =
-      ralloc(data->unpacked_of, struct unpack_key);
-   entry_key->src = packed;
-   entry_key->swizzle = 0;
-   struct unpacked_pair *entry =
-      ralloc(data->unpacked_of, struct unpacked_pair);
-   entry->v3 = rv3;
-   entry->shift = rshift;
-   entry->is_inf = r_is_inf;
-   entry->inf_sign = r_inf_sign;
-   _mesa_hash_table_insert(data->unpacked_of, entry_key, entry);
+   cache_pack_output(data, packed, (struct unpacked_pair) {
+      .v3 = rv3, .shift = rshift,
+      .is_inf = r_is_inf, .inf_sign = r_inf_sign,
+   });
 
    return packed;
 }
+
+/* Lower a 64-bit fadd: unpack both operands, align them to a common
+ * shift (max(sa, sb)) by scaling the smaller-shift operand's vec3 down
+ * by 2^delta, run __fadd64_unpacked on the aligned vec3s, pack with the
+ * shared shift. Propagate inf taint and emit the inf bcsel fallback the
+ * same way lower_fmul_chained does.
+ */
+static nir_def *
+lower_fadd_chained(nir_builder *b, struct lower_doubles_data *data,
+                   nir_alu_instr *instr)
+{
+   struct unpacked_pair a = get_unpacked_v3(b, data, instr->src[0]);
+   struct unpacked_pair bp = get_unpacked_v3(b, data, instr->src[1]);
+   if (!a.v3 || !bp.v3)
+      return NULL;
+
+   nir_def *rshift   = nir_imax(b, a.shift, bp.shift);
+   nir_def *delta_a  = nir_isub(b, a.shift, rshift);
+   nir_def *delta_b  = nir_isub(b, bp.shift, rshift);
+   nir_def *scale_a  = build_scale_from_delta(b, delta_a);
+   nir_def *scale_b  = build_scale_from_delta(b, delta_b);
+   nir_def *a_aln    = nir_fmul(b, a.v3, scale_a);
+   nir_def *b_aln    = nir_fmul(b, bp.v3, scale_b);
+
+   nir_def *rv3 = inline_fadd_core_v3(b, data->softfp64, a_aln, b_aln);
+   if (!rv3)
+      return NULL;
+
+   /* Inf propagation for fadd:
+    *   r_is_inf  = a.is_inf || b.is_inf
+    *   r_inf_sign = a's sign if a is inf, else b's sign
+    * This is correct for single-inf cases and both-inf-same-sign. Both-inf
+    * -opposite-sign (should be NaN) falls through as a signed inf -- same
+    * approximation as the existing fmul chain for inf*0.
+    */
+   nir_def *r_is_inf = nir_ior(b, a.is_inf, bp.is_inf);
+   nir_def *r_inf_sign = nir_bcsel(b, a.is_inf, a.inf_sign, bp.inf_sign);
+   nir_def *chain_packed = inline_fp64_pack_v3(b, data->softfp64, rv3, rshift);
+
+   if (!chain_packed)
+      return NULL;
+
+   nir_def *inf_hi = nir_ior_imm(b, r_inf_sign, 0x7FF00000);
+   nir_def *inf_result = nir_pack_64_2x32_split(b, nir_imm_int(b, 0), inf_hi);
+   nir_def *packed = nir_bcsel(b, r_is_inf, inf_result, chain_packed);
+
+   cache_pack_output(data, packed, (struct unpacked_pair) {
+      .v3 = rv3, .shift = rshift,
+      .is_inf = r_is_inf, .inf_sign = r_inf_sign,
+   });
+
+   return packed;
+}
+
 
 /*
  * Lowers some unsupported double operations, using only:
@@ -794,6 +905,13 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
     */
    if (instr->op == nir_op_fmul && data->unpacked_of) {
       nir_def *r = lower_fmul_chained(b, (struct lower_doubles_data *)data, instr);
+      if (r)
+         return r;
+      /* Fall through to the generic packed path if setup failed. */
+   }
+
+   if (instr->op == nir_op_fadd && data->unpacked_of) {
+      nir_def *r = lower_fadd_chained(b, (struct lower_doubles_data *)data, instr);
       if (r)
          return r;
       /* Fall through to the generic packed path if setup failed. */
