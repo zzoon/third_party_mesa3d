@@ -713,7 +713,11 @@ vec3 __splitFloat64ToFloats3(uint64_t __a)
 
    frac32x = mix(frac32x | 0x100000u, frac32x, exp >= 0);
    exp = max(0, exp);
-   __shift64Right(frac32x, frac32y, shift, frac32x, frac32y);
+   uint shifted_lo = (frac32x << ((32 - shift) & 31)) | (frac32y >> shift);
+   uint shifted_hi = frac32x >> shift;
+   frac32y = mix(frac32y, shifted_lo, shift != 0);
+   frac32x = mix(frac32x, shifted_hi, shift != 0);
+
 
    uint x_frac = (frac32x << 3) | (frac32y >> 29);
    float x = __packFloat32(sign, exp, x_frac);
@@ -824,14 +828,24 @@ uint64_t __packFloat64FromFloats3(vec3 v) {
         mantissa64 = -mantissa64;
     }
 
-    int finalExp = expX + 896;
-    while ((mantissa64 & (1L << 54)) != 0L) {
-        mantissa64 >>= 1;
-        finalExp++;
+    uint64_t umant = uint64_t(mantissa64);
+    uint hi32 = uint(umant >> 32);
+    uint lo32 = uint(umant);
+    int msb;
+
+    if (hi32 != 0u) {
+        msb = findMSB(hi32) + 32;
+    } else {
+        msb = findMSB(lo32);
     }
-    while ((mantissa64 & (1L << 53)) == 0L && finalExp > 0) {
-        mantissa64 <<= 1;
-        finalExp--;
+
+    int adj = msb - 53;
+    int finalExp = expX + 896 + adj;
+
+    if (adj > 0) {
+        mantissa64 >>= adj;
+    } else if (adj < 0) {
+        mantissa64 <<= (-adj);
     }
 
     if (finalExp <= 0) { // Subnormal
