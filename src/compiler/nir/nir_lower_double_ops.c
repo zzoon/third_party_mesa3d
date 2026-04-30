@@ -561,6 +561,105 @@ def_only_chain_used(const nir_alu_instr *alu, const nir_shader *softfp64)
    return true;
 }
 
+/* tf96 chain math can't represent fp64 inf cleanly: an inf input becomes
+ * (v3=1.0, shift=1024), which a finite multiplier can pull below the pack
+ * overflow threshold (e.g., 1/0 -> +inf, then -0.046875 * +inf chains to
+ * shift=1019 -> finite -1.5*2^1019 instead of -inf). Detect inf-tainted
+ * inputs at NIR level, construct the IEEE result (signed_inf), and bcsel
+ * over the chain output. Sign and per-op semantics:
+ *   fmul:    is_inf = a_is_inf | b_is_inf,         sign = sign_a XOR sign_b
+ *   fadd:    is_inf = a_is_inf | b_is_inf,         sign of inf input
+ *   fsqrt:   is_inf = a_is_inf,                    sign = sign_a
+ *   frcp:    is_inf = a_is_zero,                   sign = sign_a
+ *   fdiv:    is_inf = a_is_inf | b_is_zero,        sign = sign_a XOR sign_b
+ *   frsq:    is_inf = a_is_zero,                   sign = sign_a
+ * NaN edge cases (0*inf, inf-inf, etc.) still produce inf via this path;
+ * conformance for those would need full inf+NaN taint tracking. */
+static nir_def *
+tf96_inf_taint_replacement(nir_builder *b, nir_alu_instr *instr,
+                           nir_def *chain_packed,
+                           const struct lower_doubles_data *data)
+{
+   const unsigned num_inputs = nir_op_infos[instr->op].num_inputs;
+   nir_def *is_inf[3] = {NULL, NULL, NULL};
+   nir_def *is_zero[3] = {NULL, NULL, NULL};
+   nir_def *sign[3] = {NULL, NULL, NULL};
+
+   for (unsigned i = 0; i < num_inputs; i++) {
+      nir_def *src = instr->src[i].src.ssa;
+      /* Lazy-pack chain producers return nir_undef as their replacement;
+       * extracting bit patterns from undef gives undefined is_inf/is_zero
+       * values that can spuriously fire the bcsel below. Treat such inputs
+       * as not-inf and not-zero. Sign is recovered from the cached v3.x
+       * (split-to-floats preserves the fp64 sign bit on each component),
+       * which matters for fmul/fdiv result_sign = sign_a XOR sign_b: a
+       * lazy-undef adj operand still carries its sign through cache. */
+      if (src->parent_instr->type == nir_instr_type_undef) {
+         is_inf[i] = nir_imm_false(b);
+         nir_def *cached_v3 =
+            convert_double_before_inline(b, instr->src[i], data, true);
+         if (cached_v3) {
+            nir_def *vx = nir_channel(b, cached_v3, 0);
+            /* value = v3 * 2^shift is zero iff v3 itself is zero (after
+             * tf_renormalize, v3.x dominates -- testing v3.x == 0 is
+             * equivalent to "all components zero" for renormalized v3). */
+            is_zero[i] = nir_feq_imm(b, vx, 0.0f);
+            sign[i] = nir_iand_imm(b, vx, 0x80000000);
+         } else {
+            is_zero[i] = nir_imm_false(b);
+            sign[i] = nir_imm_int(b, 0);
+         }
+         continue;
+      }
+      nir_def *hi = nir_unpack_64_2x32_split_y(b, src);
+      nir_def *exp = nir_iand_imm(b, nir_ushr_imm(b, hi, 20), 0x7FF);
+      is_inf[i] = nir_ieq_imm(b, exp, 0x7FF);
+      /* zero / -zero: bottom 63 bits all zero. */
+      nir_def *abs_hi = nir_iand_imm(b, hi, 0x7FFFFFFF);
+      nir_def *lo = nir_unpack_64_2x32_split_x(b, src);
+      is_zero[i] = nir_iand(b, nir_ieq_imm(b, abs_hi, 0),
+                               nir_ieq_imm(b, lo, 0));
+      sign[i] = nir_iand_imm(b, hi, 0x80000000);
+   }
+
+   nir_def *result_is_inf;
+   nir_def *result_sign;
+   switch (instr->op) {
+   case nir_op_fmul:
+      result_is_inf = nir_ior(b, is_inf[0], is_inf[1]);
+      result_sign = nir_ixor(b, sign[0], sign[1]);
+      break;
+   case nir_op_fadd:
+      result_is_inf = nir_ior(b, is_inf[0], is_inf[1]);
+      result_sign = nir_bcsel(b, is_inf[0], sign[0], sign[1]);
+      break;
+   case nir_op_fsqrt:
+      result_is_inf = is_inf[0];
+      result_sign = sign[0];
+      break;
+   case nir_op_frcp:
+      result_is_inf = is_zero[0];
+      result_sign = sign[0];
+      break;
+   case nir_op_fdiv:
+      result_is_inf = nir_ior(b, is_inf[0], is_zero[1]);
+      result_sign = nir_ixor(b, sign[0], sign[1]);
+      break;
+   case nir_op_frsq:
+      result_is_inf = is_zero[0];
+      result_sign = sign[0];
+      break;
+   default:
+      return chain_packed;
+   }
+
+   nir_def *signed_inf_hi = nir_ior_imm(b, result_sign, 0x7FF00000);
+   nir_def *signed_inf =
+      nir_pack_64_2x32_split(b, nir_imm_int(b, 0), signed_inf_hi);
+
+   return nir_bcsel(b, result_is_inf, signed_inf, chain_packed);
+}
+
 static nir_def *
 lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
                             const struct lower_doubles_data *data)
@@ -870,10 +969,14 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
        * skip the pack and use a fresh undef as the cache key. The undef
        * gets DCE'd once consumers are lowered. */
       nir_def *replacement;
-      if (data->current_lazy_pack)
+      if (data->current_lazy_pack) {
          replacement = nir_undef(b, 1, 64);
-      else
+      } else {
          replacement = convert_double_pack_tf96(b, result_v3, result_shift, data);
+         /* Apply IEEE inf override -- chain (v3, shift) misrepresents inf
+          * as a near-overflow finite that pack often fails to detect. */
+         replacement = tf96_inf_taint_replacement(b, instr, replacement, data);
+      }
 
       struct nir_lower_double_def *key =
          ralloc(b->shader, struct nir_lower_double_def);
