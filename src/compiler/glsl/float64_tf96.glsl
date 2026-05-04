@@ -857,6 +857,43 @@ uint64_t __packFloat64FromFloats3(vec3 v) {
     return __packFloat64(signX, finalExp, fracHi, fracLo);
 }
 
+/* Folded fp64 <-> (vec3, shift) interface for chain caching.
+ * The shift is stripped out of the fp64 exponent so the vec3 live
+ * in fp32-safe range regardless of the original fp64 magnitude.
+ */
+vec3 __unpackFp64ToFp32(uint64_t __a, out int shift)
+{
+   int exp = __extractFloat64Exp(__a);
+   if (exp > 0) {
+      shift = exp - 0x3FF;
+      uint64_t folded = (__a & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+      return __splitFloat64ToFloats3(folded);
+   } else {
+      shift = 0;
+      return __splitFloat64ToFloats3(__a);
+   }
+}
+
+/* Pack the triple-float back to fp64 and bake the cumulative shift into
+ * the exponent.
+ */
+uint64_t __packFp32ToFp64(vec3 v3, int shift)
+{
+   uint64_t result = __packFloat64FromFloats3(v3);
+   if (result == 0ul || shift == 0)
+      return result;
+
+   int finalExp = __extractFloat64Exp(result) + shift;
+   uint sign = __extractFloat64Sign(result);
+
+   if (finalExp >= 0x7FF)
+      return __packFloat64(sign, 0x7FF, 0u, 0u);
+   if (finalExp <= 0)
+      return __packFloat64(sign, 0, 0u, 0u);
+
+   return (result & 0x800FFFFFFFFFFFFFul) | (uint64_t(finalExp) << 52);
+}
+
 
 /* Inner addition function on triple-float operands pre-aligned to a common
  * scale by the caller. No fold/unfold or pack/split: intended to be chained
