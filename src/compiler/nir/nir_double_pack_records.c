@@ -73,6 +73,7 @@ nir_def *convert_double_before_inline(nir_builder *b, nir_alu_src src, const str
    key->index = src.swizzle[0];
    key->src = src.src.ssa;
    key->dest = NULL;
+   key->shift_dest = NULL;
    key->packed = unpack;
    struct nir_lower_double_def *dest_def = get_lower_double_def(data->defs, key);
    if ((dest_def && dest_def->packed == !unpack) || (dest_def == NULL && !unpack)) {
@@ -99,6 +100,42 @@ nir_def *convert_double_before_inline(nir_builder *b, nir_alu_src src, const str
       b->cursor = nir_after_instr(key->src->parent_instr);
    }
 
+   /* tf96 unpack has a different signature than float64q's:
+    *   vec3 __unpackFp64ToFp32(uint64_t a, out int shift)
+    * (vs float64q's `uint64_t __unpackFp64ToFp32(uint64_t a)`).
+    * Branch only on this divergent case; pack direction and float64q
+    * unpack stay on the original 1-in/1-out path below. */
+   if (unpack && is_tf96_softfp64(softfp64)) {
+      nir_variable *ret_tmp =
+         nir_local_variable_create(b->impl, glsl_vec_type(3), "return_unpack");
+      nir_deref_instr *ret_deref = nir_build_deref_var(b, ret_tmp);
+
+      nir_variable *param =
+         nir_local_variable_create(b->impl, glsl_uint64_t_type(), "param_unpack");
+      nir_deref_instr *param_deref = nir_build_deref_var(b, param);
+      nir_store_deref(b, param_deref, nir_mov_alu(b, src, 1), ~0);
+
+      nir_variable *shift_tmp =
+         nir_local_variable_create(b->impl, glsl_int_type(), "return_unpack_shift");
+      nir_deref_instr *shift_deref = nir_build_deref_var(b, shift_tmp);
+
+      nir_def *params[3] = {
+         &ret_deref->def,
+         &param_deref->def,
+         &shift_deref->def,
+      };
+      nir_inline_function_impl(b, func->impl, params, NULL);
+
+      key->dest = nir_load_deref(b, ret_deref);
+      key->shift_dest = nir_load_deref(b, shift_deref);
+      add_lower_double_def(data->defs, key);
+
+      if (adj_cursor) {
+         b->cursor = curr_cursor;
+      }
+      return key->dest;
+   }
+
    nir_def *params[2] = {NULL, NULL}; // 2: two defs
    const struct glsl_type *param_type = glsl_uint64_t_type();
    nir_variable *ret_tmp =
@@ -121,6 +158,54 @@ nir_def *convert_double_before_inline(nir_builder *b, nir_alu_src src, const str
       b->cursor = curr_cursor;
    }
    return key->dest;
+}
+
+/* The shift SSA(for tf96) can't be returned through the function's nir_def* return,
+ * so it's stored into the cache entry. Callers retrieve it here. */
+nir_def *get_tf96_shift_dest(const struct lower_doubles_data *data, nir_alu_src src)
+{
+   if (!is_tf96_softfp64(data->softfp64))
+      return NULL;
+
+   struct nir_lower_double_def key;
+   key.src = src.src.ssa;
+   key.index = src.swizzle[0];
+   key.packed = true;     /* unpack entries are stored with packed=true (= unpack=true) */
+   struct nir_lower_double_def *cached = get_lower_double_def(data->defs, &key);
+   return cached ? cached->shift_dest : NULL;
+}
+
+nir_def *convert_double_pack_tf96(nir_builder *b,
+                                  nir_def *v3, nir_def *shift,
+                                  const struct lower_doubles_data *data)
+{
+   const nir_shader *softfp64 = data->softfp64;
+   nir_function *func = nir_shader_get_function_for_name(softfp64, "__packFp32ToFp64");
+   if (!func || !func->impl)
+      return NULL;
+
+   nir_variable *ret_tmp =
+      nir_local_variable_create(b->impl, glsl_uint64_t_type(), "tf96_pack_ret");
+   nir_deref_instr *ret_deref = nir_build_deref_var(b, ret_tmp);
+
+   nir_variable *v3_tmp =
+      nir_local_variable_create(b->impl, glsl_vec_type(3), "tf96_pack_v3");
+   nir_deref_instr *v3_deref = nir_build_deref_var(b, v3_tmp);
+   nir_store_deref(b, v3_deref, v3, ~0);
+
+   nir_variable *shift_tmp =
+      nir_local_variable_create(b->impl, glsl_int_type(), "tf96_pack_shift");
+   nir_deref_instr *shift_deref = nir_build_deref_var(b, shift_tmp);
+   nir_store_deref(b, shift_deref, shift, ~0);
+
+   nir_def *params[3] = {
+      &ret_deref->def,
+      &v3_deref->def,
+      &shift_deref->def,
+   };
+   nir_inline_function_impl(b, func->impl, params, NULL);
+
+   return nir_load_deref(b, ret_deref);
 }
 
 nir_def *pack_double_before_lower_phi(nir_builder *b, nir_phi_instr *instr, const struct lower_doubles_data *data)
@@ -173,4 +258,10 @@ bool is_quick_softfp64(const nir_shader *softfp64)
       return true;
    }
    return false;
+}
+
+bool is_tf96_softfp64(const nir_shader *softfp64)
+{
+   return softfp64 && softfp64->info.label &&
+          strcmp(softfp64->info.label, "float64 tf96") == 0;
 }

@@ -531,6 +531,36 @@ lower_sat(nir_builder *b, nir_def *src)
    return sat;
 }
 
+/* Set of ops that have a tf96 chain (vec3-input core) lowering. Producer
+ * and consumer must both be in this set for lazy-pack to be safe. */
+static inline bool
+is_tf96_chain_op(nir_op op)
+{
+   return op == nir_op_fmul || op == nir_op_fadd;
+}
+
+/* Lazy-pack predicate: every use of `alu->def` is itself a chain-lowerable op. */
+static bool
+def_only_chain_used(const nir_alu_instr *alu, const nir_shader *softfp64)
+{
+   if (!is_tf96_softfp64(softfp64))
+      return false;
+   if (!is_tf96_chain_op(alu->op))
+      return false;
+   if (nir_def_used_by_if(&alu->def))
+      return false;
+
+   nir_foreach_use(use, &alu->def) {
+      const nir_instr *user = nir_src_parent_instr(use);
+      if (user->type != nir_instr_type_alu)
+         return false;
+      const nir_alu_instr *user_alu = nir_instr_as_alu(user);
+      if (!is_tf96_chain_op(user_alu->op))
+         return false;
+   }
+   return true;
+}
+
 static nir_def *
 lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
                             const struct lower_doubles_data *data)
@@ -544,6 +574,12 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
    const struct glsl_type *return_type = glsl_uint64_t_type();
    const nir_shader *softfp64 = data->softfp64;
    bool unpack = false;
+
+   const bool tf96_fmul_chain =
+      (instr->op == nir_op_fmul && is_tf96_softfp64(softfp64));
+   const bool tf96_fadd_chain =
+      (instr->op == nir_op_fadd && is_tf96_softfp64(softfp64));
+   const bool tf96_chain = tf96_fmul_chain || tf96_fadd_chain;
 
    switch (instr->op) {
    case nir_op_f2i64:
@@ -665,13 +701,25 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
       unpack = true;
       break;
    case nir_op_fadd:
-      name = "__fadd64";
-      mangled_name = "__fadd64(u641;u641;";
+      if (tf96_fadd_chain) {
+         name = "__fadd64_core_unpacked";
+         mangled_name = "__fadd64_core_unpacked";
+         return_type = glsl_vec_type(3);
+      } else {
+         name = "__fadd64";
+         mangled_name = "__fadd64(u641;u641;";
+      }
       unpack = true;
       break;
    case nir_op_fmul:
-      name = "__fmul64";
-      mangled_name = "__fmul64(u641;u641;";
+      if (tf96_fmul_chain) {
+         name = "__fmul64_core_unpacked";
+         mangled_name = "__fmul64_core_unpacked";
+         return_type = glsl_vec_type(3);
+      } else {
+         name = "__fmul64";
+         mangled_name = "__fmul64(u641;u641;";
+      }
       unpack = true;
       break;
    case nir_op_ffma:
@@ -747,34 +795,96 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
    nir_deref_instr *ret_deref = nir_build_deref_var(b, ret_tmp);
    params[0] = &ret_deref->def;
 
+   nir_def *tf96_shifts[2] = {NULL, NULL};
+   nir_def *tf96_v3[2] = {NULL, NULL};
+   nir_deref_instr *tf96_param_derefs[2] = {NULL, NULL};
+
    assert(nir_op_infos[instr->op].num_inputs + 1 == func->num_params);
    for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
-      nir_alu_type n_type =
-         nir_alu_type_get_base_type(nir_op_infos[instr->op].input_types[i]);
-      /* Add bitsize */
-      n_type = n_type | instr->src[0].src.ssa->bit_size;
-
-      const struct glsl_type *param_type =
-         glsl_scalar_type(nir_get_glsl_base_type_for_nir_type(n_type));
+      const struct glsl_type *param_type;
+      if (tf96_chain) {
+         param_type = glsl_vec_type(3);
+      } else {
+         nir_alu_type n_type =
+            nir_alu_type_get_base_type(nir_op_infos[instr->op].input_types[i]);
+         /* Add bitsize */
+         n_type = n_type | instr->src[0].src.ssa->bit_size;
+         param_type =
+            glsl_scalar_type(nir_get_glsl_base_type_for_nir_type(n_type));
+      }
 
       // convert `instr->src[i]` before inline
       nir_def* src_def = NULL;
-      if (is_quick_softfp64(softfp64)) {
+      if (is_quick_softfp64(softfp64) || tf96_chain) {
          src_def = convert_double_before_inline(b, instr->src[i], data, unpack);
+      }
+      if (tf96_chain) {
+         tf96_shifts[i] = get_tf96_shift_dest(data, instr->src[i]);
+         tf96_v3[i] = src_def;
       }
 
       nir_variable *param =
          nir_local_variable_create(b->impl, param_type, "param");
       nir_deref_instr *param_deref = nir_build_deref_var(b, param);
-      nir_store_deref(b, param_deref, src_def ? src_def : nir_mov_alu(b, instr->src[i], 1), ~0);
+      /* fadd needs alignment between unpack and store; defer the store
+       * until after the loop, where both shifts are known. fmul can store
+       * raw v3 directly */
+      if (tf96_fadd_chain) {
+         tf96_param_derefs[i] = param_deref;
+      } else {
+         nir_store_deref(b, param_deref, src_def ? src_def : nir_mov_alu(b, instr->src[i], 1), ~0);
+      }
 
       assert(i + 1 < ARRAY_SIZE(params));
       params[i + 1] = &param_deref->def;
    }
 
+   /* fadd: align both operands to result_shift = max(shift_a, shift_b) by
+    * scaling the smaller-shift vec3 down by 2^(its_shift - result_shift).
+    */
+   nir_def *tf96_fadd_result_shift = NULL;
+   if (tf96_fadd_chain) {
+      tf96_fadd_result_shift = nir_imax(b, tf96_shifts[0], tf96_shifts[1]);
+      nir_def *clamp_low = nir_imm_int(b, -64);
+      nir_def *one = nir_imm_float(b, 1.0f);
+      for (unsigned i = 0; i < 2; i++) {
+         nir_def *off =
+            nir_imax(b, nir_isub(b, tf96_shifts[i], tf96_fadd_result_shift),
+                     clamp_low);
+         nir_def *scale = nir_replicate(b, nir_ldexp(b, one, off), 3);
+         nir_def *aligned = nir_fmul(b, tf96_v3[i], scale);
+         nir_store_deref(b, tf96_param_derefs[i], aligned, ~0);
+      }
+   }
+
    nir_inline_function_impl(b, func->impl, params, NULL);
 
-   if (is_quick_softfp64(softfp64)) {
+   if (tf96_chain) {
+      nir_def *result_v3 = nir_load_deref(b, ret_deref);
+      nir_def *result_shift =
+         tf96_fmul_chain ? nir_iadd(b, tf96_shifts[0], tf96_shifts[1])
+                         : tf96_fadd_result_shift;
+
+      /* When all uses are tf96 chain consumers (fmul/fadd), they will pull
+       * (v3, shift) from the cache and never read the packed SSA -- so we
+       * skip the pack and use a fresh undef as the cache key. The undef
+       * gets DCE'd once consumers are lowered. */
+      nir_def *replacement;
+      if (data->current_lazy_pack)
+         replacement = nir_undef(b, 1, 64);
+      else
+         replacement = convert_double_pack_tf96(b, result_v3, result_shift, data);
+
+      struct nir_lower_double_def *key =
+         ralloc(b->shader, struct nir_lower_double_def);
+      key->index = 0;
+      key->src = replacement;
+      key->dest = result_v3;
+      key->shift_dest = result_shift;
+      key->packed = true;
+      add_lower_double_def(data->defs, key);
+      return replacement;
+   } else if (is_quick_softfp64(softfp64)) {
       nir_def* out_def = nir_load_deref(b, ret_deref);
       if (unpack) {
          struct nir_lower_double_def *key = ralloc(b->shader, struct nir_lower_double_def);
@@ -829,8 +939,10 @@ nir_lower_doubles_op_to_options_mask(nir_op opcode)
 static bool
 should_lower_double_instr(const nir_instr *instr, const void *_data)
 {
-   const struct lower_doubles_data *data = _data;
+   struct lower_doubles_data *data = (struct lower_doubles_data *)_data;
    const nir_lower_doubles_options options = data->options;
+
+   data->current_lazy_pack = false;
 
    if (instr->type != nir_instr_type_alu) {
       if (data != NULL && is_quick_softfp64(data->softfp64)) {
@@ -852,8 +964,10 @@ should_lower_double_instr(const nir_instr *instr, const void *_data)
    if (!is_64)
       return false;
 
-   if (options & nir_lower_fp64_full_software)
+   if (options & nir_lower_fp64_full_software) {
+      data->current_lazy_pack = def_only_chain_used(alu, data->softfp64);
       return true;
+   }
 
    return options & nir_lower_doubles_op_to_options_mask(alu->op);
 }
