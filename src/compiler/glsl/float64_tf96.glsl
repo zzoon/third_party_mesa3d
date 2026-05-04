@@ -1154,6 +1154,90 @@ __ffma64(uint64_t a, uint64_t b, uint64_t c)
    return __fadd64(__fmul64(a, b), c);
 }
 
+/* Inner reciprocal on a triple-float operand. Caller is responsible for any
+ * exponent fold/unfold; this just computes 1/b in vec3 precision via two
+ * Newton iterations starting from the fp32 reciprocal of b.x.
+ *
+ *   x_{n+1} = x_n * (2 - b * x_n)
+ *
+ * Each step roughly doubles precision; from ~24 fp32 bits, two steps reach
+ * ~96 bits, more than fp64 needs. Magnitudes stay near (0.5, 1] for b in
+ * [1, 2) so the inner __fmul64_core_unpacked / __fadd64_core_unpacked calls
+ * see naturally-aligned operands without explicit scaling. */
+vec3
+__frcp64_core_unpacked(vec3 b)
+{
+   float r0 = 1.0 / b.x;
+   vec3 r = vec3(r0, 0.0, 0.0);
+   vec3 two = vec3(2.0, 0.0, 0.0);
+
+   /* iter 1 */
+   vec3 br = __fmul64_core_unpacked(b, r);
+   vec3 corr = __fadd64_core_unpacked(two, vec3(-br.x, -br.y, -br.z));
+   r = __fmul64_core_unpacked(r, corr);
+
+   /* iter 2 */
+   br = __fmul64_core_unpacked(b, r);
+   corr = __fadd64_core_unpacked(two, vec3(-br.x, -br.y, -br.z));
+   r = __fmul64_core_unpacked(r, corr);
+
+   return r;
+}
+
+uint64_t
+__frcp64(uint64_t a)
+{
+   uint sign = __extractFloat64Sign(a);
+   int expA = __extractFloat64Exp(a);
+   uint64_t mantA = a & 0xFFFFFFFFFFFFFul;
+
+   /* 1/0 = +/- inf */
+   if (expA == 0 && mantA == 0ul)
+      return __packFloat64(sign, 0x7FF, 0u, 0u);
+   /* 1/inf = +/- 0; 1/NaN = NaN */
+   if (expA == 0x7FF) {
+      if (mantA == 0ul)
+         return __packFloat64(sign, 0, 0u, 0u);
+      return a;
+   }
+   /* Subnormal: 1/sub overflows fp64 magnitude; return signed inf. */
+   if (expA == 0)
+      return __packFloat64(sign, 0x7FF, 0u, 0u);
+
+   /* Fold the exponent: 1/(m * 2^e) = (1/m) * 2^-e. */
+   int shift_exp = -(expA - 0x3FF);
+   a = (a & 0x800FFFFFFFFFFFFFul) | (0x3FFul << 52);
+
+   vec3 va = __splitFloat64ToFloats3(a);
+   vec3 result_vec3 = __frcp64_core_unpacked(va);
+   uint64_t result = __packFloat64FromFloats3(result_vec3);
+
+   if (result != 0ul && shift_exp != 0) {
+      int finalExp = __extractFloat64Exp(result) + shift_exp;
+      if (finalExp >= 0x7FF)
+         return __packFloat64(__extractFloat64Sign(result), 0x7FF, 0u, 0u);
+      if (finalExp <= 0)
+         return 0ul;
+      result = (result & 0x800FFFFFFFFFFFFFul) | (uint64_t(finalExp) << 52);
+   }
+
+   return result;
+}
+
+/* Inner divide on triple-float operands. Caller manages the shift
+ * composition (a_shift - b_shift) at the NIR level. */
+vec3
+__fdiv64_core_unpacked(vec3 a, vec3 b)
+{
+   return __fmul64_core_unpacked(a, __frcp64_core_unpacked(b));
+}
+
+uint64_t
+__fdiv64(uint64_t a, uint64_t b)
+{
+   return __fmul64(a, __frcp64(b));
+}
+
 /* Returns the result of converting the double-precision floating-point value
  * `a' to the unsigned integer format.  The conversion is performed according
  * to the IEEE Standard for Floating-Point Arithmetic.
@@ -1800,7 +1884,21 @@ __fsqrt64(uint64_t __a)
    return result;
 }
 
+/* Inner reciprocal-sqrt on a triple-float operand. Composition of the
+ * existing sqrt and rcp cores. Caller is responsible for the parity-based
+ * v3 adjustment (same as fsqrt) and for negating raw_shift >> 1 to get
+ * the output shift. */
+vec3
+__frsq64_core_unpacked(vec3 a)
+{
+   return __frcp64_core_unpacked(__fsqrt64_core_unpacked(a));
+}
 
+uint64_t
+__frsq64(uint64_t a)
+{
+   return __frcp64(__fsqrt64(a));
+}
 
 
 
