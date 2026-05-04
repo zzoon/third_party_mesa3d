@@ -536,7 +536,7 @@ lower_sat(nir_builder *b, nir_def *src)
 static inline bool
 is_tf96_chain_op(nir_op op)
 {
-   return op == nir_op_fmul || op == nir_op_fadd;
+   return op == nir_op_fmul || op == nir_op_fadd || op == nir_op_fsqrt;
 }
 
 /* Lazy-pack predicate: every use of `alu->def` is itself a chain-lowerable op. */
@@ -678,7 +678,10 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
       (instr->op == nir_op_fmul && is_tf96_softfp64(softfp64));
    const bool tf96_fadd_chain =
       (instr->op == nir_op_fadd && is_tf96_softfp64(softfp64));
-   const bool tf96_chain = tf96_fmul_chain || tf96_fadd_chain;
+   const bool tf96_fsqrt_chain =
+      (instr->op == nir_op_fsqrt && is_tf96_softfp64(softfp64));
+   const bool tf96_chain =
+      tf96_fmul_chain || tf96_fadd_chain || tf96_fsqrt_chain;
 
    switch (instr->op) {
    case nir_op_f2i64:
@@ -836,8 +839,14 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
       return_type = glsl_bool_type();
       break;
    case nir_op_fsqrt:
-      name = "__fsqrt64";
-      mangled_name = "__fsqrt64(u641;";
+      if (tf96_fsqrt_chain) {
+         name = "__fsqrt64_core_unpacked";
+         mangled_name = "__fsqrt64_core_unpacked";
+         return_type = glsl_vec_type(3);
+      } else {
+         name = "__fsqrt64";
+         mangled_name = "__fsqrt64(u641;";
+      }
       unpack = true;
       break;
    default:
@@ -925,10 +934,11 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
       nir_variable *param =
          nir_local_variable_create(b->impl, param_type, "param");
       nir_deref_instr *param_deref = nir_build_deref_var(b, param);
-      /* fadd needs alignment between unpack and store; defer the store
+      /* fadd/fsqrt need a per-input scaling step before storing (alignment
+       * for fadd, odd-shift parity adjustment for fsqrt). Defer the store
        * until after the loop, where both shifts are known. fmul can store
        * raw v3 directly */
-      if (tf96_fadd_chain) {
+      if (tf96_fadd_chain || tf96_fsqrt_chain) {
          tf96_param_derefs[i] = param_deref;
       } else {
          nir_store_deref(b, param_deref, src_def ? src_def : nir_mov_alu(b, instr->src[i], 1), ~0);
@@ -956,15 +966,35 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
       }
    }
 
+   /* fsqrt: __fsqrt64_core_unpacked expects v3 in [1, 4). Cached unpack
+    * gives v3 in [1, 2) with shift = raw_shift. For odd raw_shift we scale
+    * v3 by 2 (-> [2, 4)) so the residual exp is +1; for even raw_shift v3
+    * passes through. The output shift is raw_shift >> 1 (arithmetic shift,
+    * floor toward -inf, matching the GLSL `diff -= 1` for odd-negative
+    * folding). */
+   nir_def *tf96_fsqrt_result_shift = NULL;
+   if (tf96_fsqrt_chain) {
+      nir_def *raw_shift = tf96_shifts[0];
+      nir_def *odd = nir_iand_imm(b, raw_shift, 1);
+      nir_def *scale_scalar =
+         nir_bcsel(b, nir_ine_imm(b, odd, 0),
+                   nir_imm_float(b, 2.0f), nir_imm_float(b, 1.0f));
+      nir_def *scale = nir_replicate(b, scale_scalar, 3);
+      nir_def *adjusted = nir_fmul(b, tf96_v3[0], scale);
+      nir_store_deref(b, tf96_param_derefs[0], adjusted, ~0);
+      tf96_fsqrt_result_shift = nir_ishr_imm(b, raw_shift, 1);
+   }
+
    nir_inline_function_impl(b, func->impl, params, NULL);
 
    if (tf96_chain) {
       nir_def *result_v3 = nir_load_deref(b, ret_deref);
       nir_def *result_shift =
-         tf96_fmul_chain ? nir_iadd(b, tf96_shifts[0], tf96_shifts[1])
-                         : tf96_fadd_result_shift;
+         tf96_fmul_chain ? nir_iadd(b, tf96_shifts[0], tf96_shifts[1]) :
+         tf96_fadd_chain ? tf96_fadd_result_shift :
+                           tf96_fsqrt_result_shift;
 
-      /* When all uses are tf96 chain consumers (fmul/fadd), they will pull
+      /* When all uses are tf96 chain consumers, they will pull
        * (v3, shift) from the cache and never read the packed SSA -- so we
        * skip the pack and use a fresh undef as the cache key. The undef
        * gets DCE'd once consumers are lowered. */

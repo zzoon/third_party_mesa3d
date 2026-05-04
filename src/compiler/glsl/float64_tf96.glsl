@@ -1689,36 +1689,23 @@ __estimateSqrt32(int aExp, uint a)
    return ((__estimateDiv64To32(a, 0u, z))>>1) + (z>>1);
 }
 
-uint64_t
-__fsqrt64(uint64_t __a)
+/* Inner sqrt function on triple-float operand. Caller must pre-fold a so
+ * its magnitude is in [1, 4): for an fp64 input with raw shift k, pass v3
+ * with magnitude 2^(k & 1) and use new_shift = k >> 1 outside. Result
+ * vec3 is in [1, 2). No pack/split: intended to be chained without
+ * re-materializing a uint64_t each time. Mirrors the dual-pass body of
+ * __fsqrt64. */
+vec3
+__fsqrt64_core_unpacked(vec3 a)
 {
-   // ==========================================
-   // 1. Edge Cases
-   // ==========================================
-   if (__a == 0ul || __a == 0x8000000000000000ul) return __a;
-   uint sign = __extractFloat64Sign(__a);
-   if (sign != 0u) return 0xFFFFFFFFFFFFFFFFul; // NaN
-   int expA = __extractFloat64Exp(__a);
-   if (expA == 0x7FF) return __a; // Infinity
-
-   // ==========================================
-   // 2. Exponent Folding
-   // ==========================================
-   int shift_exp = 0;
-   if (expA > 0) {
-       int diff = expA - 0x3FF;
-       if ((diff & 1) != 0) diff -= 1;
-
-       shift_exp = diff / 2;
-       int nExp = expA - diff;
-       __a = (__a & 0x800FFFFFFFFFFFFFul) | (uint64_t(nExp) << 52);
-   }
-
-   vec3 a = __splitFloat64ToFloats3(__a);
-
-   // ==========================================
-   // 3. Dual-Pass Sqrt
-   // ==========================================
+   /* sqrt(0) = 0. Without this guard, inversesqrt(0) returns +/- inf in
+    * fp32 and the Newton iteration propagates inf/NaN through r*a.x,
+    * twoProd, etc., yielding a packed garbage value. The packed __fsqrt64
+    * handles this at the top with an early-return; mirror that for the
+    * chain core so a chain whose input cancels to zero (e.g.,
+    * distance(a,a) -> sqrt(0)) returns a clean zero. */
+   if (a.x == 0.0)
+      return vec3(0.0, 0.0, 0.0);
 
    // --- Pass 1 (44 bits) ---
    float r = inversesqrt(a.x);
@@ -1765,7 +1752,36 @@ __fsqrt64(uint64_t __a)
    vec2 f1 = __twoSum(x_pass1.y, t_lo);
    vec2 f_mid = __twoSum(f0.y, f1.x);
 
-   vec3 result_vec3 = __tf_renormalize(f0.x, f_mid.x, f_mid.y + f1.y);
+   return __tf_renormalize(f0.x, f_mid.x, f_mid.y + f1.y);
+}
+
+uint64_t
+__fsqrt64(uint64_t __a)
+{
+   // ==========================================
+   // 1. Edge Cases
+   // ==========================================
+   if (__a == 0ul || __a == 0x8000000000000000ul) return __a;
+   uint sign = __extractFloat64Sign(__a);
+   if (sign != 0u) return 0xFFFFFFFFFFFFFFFFul; // NaN
+   int expA = __extractFloat64Exp(__a);
+   if (expA == 0x7FF) return __a; // Infinity
+
+   // ==========================================
+   // 2. Exponent Folding
+   // ==========================================
+   int shift_exp = 0;
+   if (expA > 0) {
+       int diff = expA - 0x3FF;
+       if ((diff & 1) != 0) diff -= 1;
+
+       shift_exp = diff / 2;
+       int nExp = expA - diff;
+       __a = (__a & 0x800FFFFFFFFFFFFFul) | (uint64_t(nExp) << 52);
+   }
+
+   vec3 a = __splitFloat64ToFloats3(__a);
+   vec3 result_vec3 = __fsqrt64_core_unpacked(a);
    uint64_t result = __packFloat64FromFloats3(result_vec3);
 
    // ==========================================
