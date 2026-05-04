@@ -967,28 +967,6 @@ __fadd64(uint64_t __a, uint64_t __b)
    vec3 b = __splitFloat64ToFloats3(b_fold);
 
    // ==========================================
-   // Edge Case handling
-   // ==========================================
-   bool a_isnan = __is_nan(__a);
-   bool b_isnan = __is_nan(__b);
-   if (a_isnan || b_isnan) return __propagateFloat64NaN(__a, __b);
-
-   bool a_isinf = (expA == 0x7FF);
-   bool b_isinf = (expB == 0x7FF);
-
-   if (a_isinf) {
-       if (b_isinf && (__extractFloat64Sign(__a) != __extractFloat64Sign(__b)))
-           return 0xFFFFFFFFFFFFFFFFul;
-       return __a;
-   }
-   if (b_isinf) return __b;
-
-   bool a_iszero = ((__a & 0x7FFFFFFFFFFFFFFFul) == 0ul);
-   bool b_iszero = ((__b & 0x7FFFFFFFFFFFFFFFul) == 0ul);
-   if (a_iszero) return __b;
-   if (b_iszero) return __a;
-
-   // ==========================================
    // Math
    // ==========================================
    vec3 result_vec3 = __fadd64_core_unpacked(a, b);
@@ -1086,30 +1064,6 @@ __fmul64(uint64_t __a, uint64_t __b)
    // ==========================================
    vec3 a = __splitFloat64ToFloats3(a_fold);
    vec3 b = __splitFloat64ToFloats3(b_fold);
-
-   // ==========================================
-   // Edge Case handling
-   // ==========================================
-   bool a_isnan = __is_nan(__a);
-   bool b_isnan = __is_nan(__b);
-   if (a_isnan || b_isnan) return __propagateFloat64NaN(__a, __b);
-
-   bool a_isinf = (expA == 0x7FF);
-   bool b_isinf = (expB == 0x7FF);
-   bool a_iszero = ((__a & 0x7FFFFFFFFFFFFFFFul) == 0ul);
-   bool b_iszero = ((__b & 0x7FFFFFFFFFFFFFFFul) == 0ul);
-
-   if (a_isinf) {
-       if (b_iszero) return 0xFFFFFFFFFFFFFFFFul;
-       return __packFloat64(signRes, 0x7FF, 0u, 0u);
-   }
-   if (b_isinf) {
-       if (a_iszero) return 0xFFFFFFFFFFFFFFFFul;
-       return __packFloat64(signRes, 0x7FF, 0u, 0u);
-   }
-   if (a_iszero || b_iszero) {
-       return __packFloat64(signRes, 0, 0u, 0u);
-   }
 
    // ==========================================
    // Math
@@ -1856,15 +1810,7 @@ __fsqrt64_core_unpacked(vec3 a)
 uint64_t
 __fsqrt64(uint64_t __a)
 {
-   // ==========================================
-   // 1. Edge Cases
-   // ==========================================
-   if (__a == 0ul || __a == 0x8000000000000000ul) return __a;
-   uint sign = __extractFloat64Sign(__a);
-   if (sign != 0u) return 0xFFFFFFFFFFFFFFFFul; // NaN
    int expA = __extractFloat64Exp(__a);
-   if (expA == 0x7FF) return __a; // Infinity
-
    // ==========================================
    // 2. Exponent Folding
    // ==========================================
