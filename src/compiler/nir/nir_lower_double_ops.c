@@ -970,6 +970,30 @@ lower_doubles_instr_to_soft(nir_builder *b, nir_alu_instr *instr,
        * gets DCE'd once consumers are lowered. */
       nir_def *replacement;
       if (data->current_lazy_pack) {
+         /* Change result_v3 to [1, 2) magnitude before caching. Without
+          * the pack/unpack round-trip that non-lazy gets at chain
+          * boundaries, lazy chains keep v3 unfolded (e.g., [1, 4) after
+          * fmul, growing further across consecutive chain ops).
+          *
+          * This represents:
+          *
+          * exp = frexp_exp(v3.x)
+          * fold = exp - 1
+          * v3 /= 2^fold
+          * shift += fold
+          *
+          */
+         nir_def *vx = nir_channel(b, result_v3, 0);
+         nir_def *exp = nir_frexp_exp(b, vx);
+         nir_def *fold = nir_iadd_imm(b, exp, -1);
+         nir_def *neg_fold = nir_ineg(b, fold);
+         nir_def *scale =
+            nir_replicate(b,
+                          nir_ldexp(b, nir_imm_float(b, 1.0f), neg_fold),
+                          3);
+         result_v3 = nir_fmul(b, result_v3, scale);
+         result_shift = nir_iadd(b, result_shift, fold);
+
          replacement = nir_undef(b, 1, 64);
       } else {
          replacement = convert_double_pack_tf96(b, result_v3, result_shift, data);
